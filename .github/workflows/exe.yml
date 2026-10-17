@@ -3,12 +3,7 @@ name: Build Windows .exe
 on:
   workflow_dispatch:
   push:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/exe.yml"
+    branches: [main, xray-ci]
 
 jobs:
   build-windows:
@@ -26,13 +21,12 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
 
-      - name: Run engine tests on Windows
+      - name: Engine tests on Windows
         run: cargo test --lib --release
 
-      - name: Rename to a friendly exe
-        run: |
-          Copy-Item target\x86_64-pc-windows-msvc\release\xray-viewer.exe xray-viewer.exe
-          Get-Item xray-viewer.exe | Format-List Name, Length
+      - name: Friendly name
+        shell: pwsh
+        run: Copy-Item target\x86_64-pc-windows-msvc\release\xray-viewer.exe xray-viewer.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -40,3 +34,16 @@ jobs:
           name: xray-viewer-windows-x86_64
           path: xray-viewer.exe
           if-no-files-found: error
+
+      - name: Push exe to dist-exe branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b dist-exe
+          git add xray-viewer.exe
+          git commit -m "Windows x64 exe ($(date -u +%Y-%m-%d))" || echo "no changes"
+          git push -f origin dist-exe

@@ -5,6 +5,9 @@
 //! scan gate and a defects tally.
 
 #![allow(clippy::cast_possible_truncation)]
+// On Windows, build as a GUI app (no black console window behind the egui window).
+// No effect on Linux/macOS.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::time::Instant;
 
