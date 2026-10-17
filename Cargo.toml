@@ -6,7 +6,9 @@ edition = "2021"
 [dependencies]
 egui = "0.31"
 eframe = "0.31"
-dicom = "0.9"
+dicom = { version = "0.9", default-features = false, features = ["pixeldata"] }
+dicom-pixeldata = { version = "0.9", features = ["openjp2", "jpeg", "rle"] }
+dicom-transfer-syntax-registry = "0.9"
 
 [profile.release]
 opt-level = 3

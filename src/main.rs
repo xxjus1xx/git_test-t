@@ -122,9 +122,14 @@ impl DicomState {
     /// Map one sample (as f64) to 8-bit gray using window/level + invert.
     fn map_sample(&self, v: f64) -> u8 {
         let c = self.win_center;
+        // Prevent division by zero - width must be at least 1.0
         let w = self.win_width.max(1.0);
         let lower = c - w / 2.0;
         let upper = c + w / 2.0;
+        // Clamp to avoid NaN from division when upper == lower
+        if upper <= lower {
+            return 0;
+        }
         let t = (v - lower) / (upper - lower);
         let g = if t <= 0.0 {
             0.0
@@ -134,19 +139,37 @@ impl DicomState {
             t * 255.0
         };
         let g = if self.invert { 255.0 - g } else { g };
-        g as u8
+        // Clamp to u8 range to prevent overflow/underflow
+        g.clamp(0.0, 255.0) as u8
     }
 
     /// Render the current frame to an 8-bit gray ColorImage.
+    /// For RGB (spp==3), we convert to grayscale using standard luma coefficients.
     fn to_image(&self, f: &DcmFrame) -> egui::ColorImage {
         let n = (f.rows as usize) * (f.cols as usize);
         let spp = (f.spp as usize).max(1);
         let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let v = f.samples.get(i * spp).copied().unwrap_or(0.0);
-            let g = self.map_sample(v as f64);
-            out.push(Color32::from_rgb(g, g, g));
+        
+        if spp == 3 {
+            // RGB mode - convert to grayscale using luma coefficients
+            for i in 0..n {
+                let r = f.samples.get(i * 3).copied().unwrap_or(0.0) as f64;
+                let g = f.samples.get(i * 3 + 1).copied().unwrap_or(0.0) as f64;
+                let b = f.samples.get(i * 3 + 2).copied().unwrap_or(0.0) as f64;
+                // Standard ITU-R BT.601 luma coefficients
+                let gray = 0.299 * r + 0.587 * g + 0.114 * b;
+                let g_val = self.map_sample(gray);
+                out.push(Color32::from_rgb(g_val, g_val, g_val));
+            }
+        } else {
+            // Grayscale mode (spp == 1)
+            for i in 0..n {
+                let v = f.samples.get(i).copied().unwrap_or(0.0);
+                let g = self.map_sample(v as f64);
+                out.push(Color32::from_rgb(g, g, g));
+            }
         }
+        
         egui::ColorImage {
             size: [f.cols as usize, f.rows as usize],
             pixels: out,
@@ -438,6 +461,8 @@ impl XrayApp {
                         ));
                         if f.photometric_invert {
                             ui.small("MONOCHROME1");
+                        } else {
+                            ui.small("MONOCHROME2/RGB");
                         }
                     });
                     ui.separator();

@@ -3,6 +3,14 @@
 //!
 //! The GUI owns window/level and inversion so it can be adjusted live; this
 //! module only decodes samples and dimensions.
+//!
+//! Supported transfer syntaxes:
+//!   * Implicit VR Little Endian (default, uncompressed)
+//!   * JPEG Baseline (Lossy 8-bit JPEG) - requires jpeg-decoder
+//!   * JPEG Extended (Lossy 12-bit JPEG) - requires jpeg-decoder  
+//!   * JPEGLosslessSV1 (Lossless JPEG) - requires jpeg-decoder
+//!   * JPEG2000 (Lossy/Lossless J2K) - requires openjp2
+//!   * RLE Lossless - requires rle decoder
 
 use dicom::encoding::adapters::PixelDataObject;
 use dicom::object::open_file;
@@ -165,22 +173,41 @@ mod tests {
             entries.iter().all(|e| !e.name.contains("notes.txt")),
             "notes.txt leaked into the listing"
         );
+        
+        let mut decoded_count = 0;
+        let mut failed: Vec<String> = Vec::new();
         for e in entries.iter() {
-            let f = open_dcm(&e.path).unwrap_or_else(|err| panic!("open_dcm({}) failed: {err}", e.path));
-            let expected = (f.rows as usize) * (f.cols as usize) * f.spp as usize;
-            assert_eq!(f.samples.len(), expected, "sample count mismatch for {}", e.path);
-            assert!(f.rows > 0 && f.cols > 0);
-            assert!(!f.samples.is_empty());
-            // Signed int16 files can show negative values (rescaled).
-            let has_neg = f.samples.iter().any(|&s| s < 0.0);
-            if e.name.starts_with("chest_001") || e.name.starts_with("hand_001") {
-                // these are signed (PixelRepresentation=1) — allow negatives
-                let _ = has_neg;
+            // Every file in this folder MUST decode — we have valid
+            // uncompressed, RLE, and JPEG-Baseline fixtures, and the
+            // compressed decoders are compiled in. A failure is a real bug.
+            match open_dcm(&e.path) {
+                Ok(f) => {
+                    let expected = (f.rows as usize) * (f.cols as usize) * f.spp as usize;
+                    assert_eq!(f.samples.len(), expected, "sample count mismatch for {}", e.path);
+                    assert!(f.rows > 0 && f.cols > 0);
+                    assert!(!f.samples.is_empty());
+                    // Values must be finite and inside the 16-bit DICOM envelope
+                    // (signed rescaled values can go negative, unsigned go to 65535).
+                    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                    for s in f.samples.iter() {
+                        assert!(s.is_finite(), "non-finite sample in {}", e.path);
+                        if *s < lo { lo = *s; }
+                        if *s > hi { hi = *s; }
+                    }
+                    assert!(lo >= -65536.0 && hi <= 65535.0, "sample range out of DICOM bounds in {}: [{}..{}]", e.path, lo, hi);
+                    decoded_count += 1;
+                    println!("  OK {} {}x{} spp={} samples={} mono1={}", e.name, f.cols, f.rows, f.spp, f.samples.len(), f.photometric_invert);
+                }
+                Err(err) => {
+                    // Record and report — a failure here is a real regression.
+                    println!("  FAIL {} ({})", e.name, err);
+                    failed.push(format!("{}: {}", e.name, err));
+                }
             }
-            println!(
-                "  OK {} {}x{} spp={} samples={} mono1={}",
-                e.name, f.cols, f.rows, f.spp, f.samples.len(), f.photometric_invert
-            );
         }
+        assert!(decoded_count > 0, "No DICOM files could be decoded");
+        assert!(failed.is_empty(), "{} file(s) failed to decode: {}", failed.len(), failed.join("; "));
     }
 }
+
+
