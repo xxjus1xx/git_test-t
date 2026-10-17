@@ -1,0 +1,42 @@
+name: Build Windows .exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/exe.yml"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+
+      - name: Build (release)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+        env:
+          RUST_BACKTRACE: "1"
+
+      - name: Run engine tests on Windows
+        run: cargo test --lib --release
+
+      - name: Rename to a friendly exe
+        run: |
+          Copy-Item target\x86_64-pc-windows-msvc\release\xray-viewer.exe xray-viewer.exe
+          Get-Item xray-viewer.exe | Format-List Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-viewer-windows-x86_64
+          path: xray-viewer.exe
+          if-no-files-found: error
