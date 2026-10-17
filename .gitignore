@@ -1,12 +1,4 @@
 /target
-/*.AppImage
 /AppDir
-/squashfs-root
-
-# cross toolchain + downloads
-mingw-pkg/
-mingw-share/
-mingw-debs/
-*.deb
-winlibs.zip
-xray-viewer-win-linux.zip
+*.exe
+*.AppImage
