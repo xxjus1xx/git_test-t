@@ -3,13 +3,25 @@
 //!
 //! Two modes:
 //!   * Synthetic — the animated conveyor-belt demo (no files needed).
-//!   * DICOM     — open a folder of `.dcm`, list them, display with live
-//!                 window/level and an invert toggle.
+//!   * DICOM     — open a `.dcm` file (or navigate to one) and display with
+//!                 live window/level and an invert toggle.
+//!
+//! Ways to get a file into the viewer (all of these work on Wayland AND
+//! Windows):
+//!   * **File browser** (left panel) — navigate to the folder, click a `.dcm`.
+//!     This is the reliable path on Wayland, where OS drag-and-drop is not
+//!     supported by the egui/winit stack.
+//!   * **Type a file path** into the "file" field and hit *load*.
+//!   * **Type a folder path** into the "folder" field and hit *scan*.
+//!   * **Launch with a path argument**: `xray-viewer /path/to/file.dcm`
+//!   * **Drag-and-drop** a `.dcm` (or folder) — works on Windows and X11;
+//!     ignored on Wayland (no DnD emitter there).
 
 #![allow(clippy::cast_possible_truncation)]
 // On Windows, build as a GUI app (no black console window behind the egui window).
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+use std::path::Path;
 use std::time::Instant;
 
 use eframe::egui;
@@ -28,6 +40,115 @@ enum Mode {
     Dicom,
 }
 
+/// One row in the file browser.
+#[derive(Debug, Clone)]
+struct FbEntry {
+    name: String,
+    is_dir: bool,
+    path: String,
+}
+
+/// A minimal, dependency-free file browser (pure `std::fs`). Works on
+/// Wayland (where OS DnD is unavailable) and on Windows alike.
+struct FileBrowser {
+    current_dir: String,
+    entries: Vec<FbEntry>,
+    error: String,
+}
+
+impl FileBrowser {
+    fn new() -> Self {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".into());
+        let mut fb = Self {
+            current_dir: home,
+            entries: Vec::new(),
+            error: String::new(),
+        };
+        fb.refresh();
+        fb
+    }
+
+    fn refresh(&mut self) {
+        self.entries.clear();
+        let dir = Path::new(&self.current_dir);
+        match std::fs::read_dir(dir) {
+            Ok(rd) => {
+                let mut v: Vec<FbEntry> = rd
+                    .flatten()
+                    .filter_map(|e| {
+                        let ft = e.file_type().ok()?;
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.starts_with('.') {
+                            return None; // skip hidden files/dirs
+                        }
+                        Some(FbEntry {
+                            name,
+                            is_dir: ft.is_dir(),
+                            path: e.path().to_string_lossy().to_string(),
+                        })
+                    })
+                    .collect();
+                // Directories first, then case-insensitive name order.
+                v.sort_by(|a, b| {
+                    b.is_dir
+                        .cmp(&a.is_dir)
+                        .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                });
+                self.entries = v;
+                self.error.clear();
+            }
+            Err(e) => {
+                self.error = e.to_string();
+            }
+        }
+    }
+
+    fn go_up(&mut self) {
+        if let Some(parent) = Path::new(&self.current_dir).parent() {
+            if !parent.as_os_str().is_empty() {
+                self.current_dir = parent.to_string_lossy().to_string();
+                self.refresh();
+            }
+        }
+    }
+
+    fn enter(&mut self, path: &str) {
+        self.current_dir = path.to_string();
+        self.refresh();
+    }
+
+    /// Navigate to the folder containing `file` (so a dropped/arg file's
+    /// neighbours show up in the browser).
+    fn go_to_parent_of(&mut self, file: &str) {
+        if let Some(parent) = Path::new(file).parent() {
+            if !parent.as_os_str().is_empty() {
+                self.enter(parent.to_string_lossy().as_ref());
+            }
+        }
+    }
+}
+
+/// Pure routing decision for a dropped/typed path, split out so it can be
+/// unit-tested without a GUI.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    File,
+    Folder,
+    Ignore,
+}
+
+fn route_path(p: &Path) -> Route {
+    if p.is_dir() {
+        Route::Folder
+    } else if p.is_file() {
+        Route::File
+    } else {
+        Route::Ignore
+    }
+}
+
 /// DICOM viewing state.
 struct DicomState {
     entries: Vec<xray_viewer::dicom::DcmEntry>,
@@ -36,11 +157,9 @@ struct DicomState {
     current: Option<DcmFrame>,
     current_name: String,
     load_error: String,
-    // window/level
     win_center: f64,
     win_width: f64,
     invert: bool,
-    /// Re-upload the DICOM texture when this is true.
     dirty: bool,
 }
 
@@ -72,7 +191,7 @@ impl DicomState {
     }
 
     fn load(&mut self, path: &str) {
-        let label = path.rsplit('/').next().unwrap_or(path);
+        let label = path.rsplit(['/', '\\']).next().unwrap_or(path);
         match dicom::open_dcm(path) {
             Ok(f) => {
                 let (mn, mx) = Self::signed_range(&f.samples);
@@ -90,6 +209,38 @@ impl DicomState {
         }
     }
 
+    /// Route a dropped (or launch-arg) path: directory → scan, file → load.
+    /// Returns a one-line status message for the UI.
+    fn handle_dropped_path(&mut self, p: &str) -> String {
+        let path = Path::new(p);
+        match route_path(path) {
+            Route::Ignore => format!("ignored (not a file or folder): {p}"),
+            Route::File => {
+                self.load(p);
+                if self.load_error.is_empty() {
+                    format!("loaded {p}")
+                } else {
+                    format!("load failed: {}", self.load_error.clone())
+                }
+            }
+            Route::Folder => {
+                self.scan(p);
+                if self.entries.is_empty() {
+                    format!(
+                        "no .dcm files in {p}{}",
+                        if self.scan_error.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", self.scan_error.clone())
+                        }
+                    )
+                } else {
+                    format!("{} file(s) in {p}", self.entries.len())
+                }
+            }
+        }
+    }
+
     fn auto_window(&mut self) {
         if let Some(f) = &self.current {
             let (mn, mx) = Self::signed_range(&f.samples);
@@ -103,7 +254,6 @@ impl DicomState {
         self.dirty = true;
     }
 
-    /// Min/max of the (already rescaled, f32) samples.
     fn signed_range(samples: &[f32]) -> (f64, f64) {
         let mut mn = f64::INFINITY;
         let mut mx = f64::NEG_INFINITY;
@@ -119,14 +269,11 @@ impl DicomState {
         (mn, mx)
     }
 
-    /// Map one sample (as f64) to 8-bit gray using window/level + invert.
     fn map_sample(&self, v: f64) -> u8 {
         let c = self.win_center;
-        // Prevent division by zero - width must be at least 1.0
         let w = self.win_width.max(1.0);
         let lower = c - w / 2.0;
         let upper = c + w / 2.0;
-        // Clamp to avoid NaN from division when upper == lower
         if upper <= lower {
             return 0;
         }
@@ -139,37 +286,31 @@ impl DicomState {
             t * 255.0
         };
         let g = if self.invert { 255.0 - g } else { g };
-        // Clamp to u8 range to prevent overflow/underflow
         g.clamp(0.0, 255.0) as u8
     }
 
-    /// Render the current frame to an 8-bit gray ColorImage.
-    /// For RGB (spp==3), we convert to grayscale using standard luma coefficients.
     fn to_image(&self, f: &DcmFrame) -> egui::ColorImage {
         let n = (f.rows as usize) * (f.cols as usize);
         let spp = (f.spp as usize).max(1);
         let mut out = Vec::with_capacity(n);
-        
+
         if spp == 3 {
-            // RGB mode - convert to grayscale using luma coefficients
             for i in 0..n {
                 let r = f.samples.get(i * 3).copied().unwrap_or(0.0) as f64;
                 let g = f.samples.get(i * 3 + 1).copied().unwrap_or(0.0) as f64;
                 let b = f.samples.get(i * 3 + 2).copied().unwrap_or(0.0) as f64;
-                // Standard ITU-R BT.601 luma coefficients
-                let gray = 0.299 * r + 0.587 * g + 0.114 * b;
+                let gray = 0.299 * r + 0.587 * g + 0.114 * b; // BT.601 luma
                 let g_val = self.map_sample(gray);
                 out.push(Color32::from_rgb(g_val, g_val, g_val));
             }
         } else {
-            // Grayscale mode (spp == 1)
             for i in 0..n {
                 let v = f.samples.get(i).copied().unwrap_or(0.0);
                 let g = self.map_sample(v as f64);
                 out.push(Color32::from_rgb(g, g, g));
             }
         }
-        
+
         egui::ColorImage {
             size: [f.cols as usize, f.rows as usize],
             pixels: out,
@@ -194,6 +335,9 @@ struct XrayApp {
     // DICOM
     dcm: DicomState,
     dcm_tex: egui::TextureHandle,
+    file_path: String,
+    fb: FileBrowser,
+    status: String,
 }
 
 impl XrayApp {
@@ -214,7 +358,7 @@ impl XrayApp {
         let black = egui::ColorImage::new([2, 2], Color32::BLACK);
         let dcm_tex = cc.egui_ctx.load_texture(DCM_TEX, black, egui::TextureOptions::LINEAR);
 
-        Self {
+        let mut app = Self {
             mode: Mode::Dicom,
             source,
             syn_tex,
@@ -228,6 +372,39 @@ impl XrayApp {
             acc: 0.0,
             dcm: DicomState::new(),
             dcm_tex,
+            file_path: String::new(),
+            fb: FileBrowser::new(),
+            status: String::new(),
+        };
+
+        // If launched with a file/folder path argument, use it immediately.
+        for arg in std::env::args().skip(1) {
+            if Path::new(&arg).exists() {
+                app.status = app.dcm.handle_dropped_path(&arg);
+                app.fb.go_to_parent_of(&arg);
+                break;
+            }
+        }
+
+        app
+    }
+
+    /// Consume any files dropped onto the window this frame (OS-level DnD,
+    /// surfaced by egui via `raw.dropped_files`). On Wayland this list stays
+    /// empty (no DnD emitter), which is harmless — the file browser covers it.
+    fn handle_dropped(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<std::path::PathBuf> = ctx
+            .input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect()
+            });
+        for p in dropped {
+            let ps = p.to_string_lossy().to_string();
+            self.status = self.dcm.handle_dropped_path(&ps);
+            self.fb.go_to_parent_of(&ps);
         }
     }
 
@@ -252,6 +429,8 @@ impl XrayApp {
 
 impl eframe::App for XrayApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_dropped(ctx);
+
         let now = Instant::now();
         let dt = now.duration_since(self.last_step).as_secs_f32();
         self.last_step = now;
@@ -265,7 +444,6 @@ impl eframe::App for XrayApp {
             };
         }
 
-        // Synthetic mode: advance the engine at wall-clock speed.
         if self.mode == Mode::Synthetic {
             self.acc += dt;
             let tick = 1.0 / 60.0;
@@ -338,7 +516,6 @@ impl XrayApp {
                     }
                 } else {
                     ui.separator();
-                    ui.label(format!("{} file(s)", self.dcm.entries.len()));
                     if !self.dcm.current_name.is_empty() {
                         ui.strong(&self.dcm.current_name);
                     }
@@ -369,16 +546,33 @@ impl XrayApp {
                     self.source.set_fill_fraction(fill);
                 });
             } else {
+                // Row 1: manual file path + folder scan (both work on Wayland).
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("folder");
-                    let mut dir = self.dcm.folder.clone();
-                    ui.add(egui::TextEdit::singleline(&mut dir).desired_width(340.0));
-                    if ui.button("scan").clicked() {
-                        if !dir.trim().is_empty() {
-                            self.dcm.scan(dir.trim());
+                    ui.strong("Open");
+                    ui.label("file");
+                    let mut fp = self.file_path.clone();
+                    ui.add(egui::TextEdit::singleline(&mut fp).desired_width(320.0));
+                    self.file_path = fp.clone();
+                    if ui.button("load").clicked() {
+                        if !fp.trim().is_empty() {
+                            self.status = self.dcm.handle_dropped_path(fp.trim());
+                            self.fb.go_to_parent_of(fp.trim());
                         }
                     }
                     ui.separator();
+                    ui.label("folder");
+                    let mut dir = self.dcm.folder.clone();
+                    ui.add(egui::TextEdit::singleline(&mut dir).desired_width(240.0));
+                    if ui.button("scan").clicked() {
+                        if !dir.trim().is_empty() {
+                            self.dcm.scan(dir.trim());
+                            self.fb.enter(dir.trim());
+                        }
+                    }
+                });
+
+                // Row 2: window/level controls.
+                ui.horizontal_wrapped(|ui| {
                     ui.label("center");
                     let mut c = self.dcm.win_center;
                     ui.add(egui::DragValue::new(&mut c).speed(10.0));
@@ -401,17 +595,32 @@ impl XrayApp {
                         self.dcm.auto_window();
                     }
                 });
-                if !self.dcm.scan_error.is_empty() {
-                    ui.colored_label(egui::Color32::from_rgb(255, 180, 90), &self.dcm.scan_error);
-                }
-                if !self.dcm.load_error.is_empty() {
-                    ui.colored_label(egui::Color32::from_rgb(255, 100, 100), &self.dcm.load_error);
-                }
+
+                // Status + errors.
+                ui.horizontal_wrapped(|ui| {
+                    if !self.status.is_empty() {
+                        ui.colored_label(egui::Color32::from_rgb(140, 200, 255), &self.status);
+                        ui.separator();
+                    }
+                    if !self.dcm.scan_error.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 180, 90),
+                            &self.dcm.scan_error,
+                        );
+                        ui.separator();
+                    }
+                    if !self.dcm.load_error.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 100, 100),
+                            &self.dcm.load_error,
+                        );
+                    }
+                });
             }
         });
     }
 
-    /// DICOM: file list (left) + image (center).
+    /// DICOM: file browser (left) + image (center).
     fn dicom_body(&mut self, ctx: &egui::Context) {
         // Re-upload the image texture only when the file / window / invert
         // actually changed (dirty flag), not every frame.
@@ -423,29 +632,57 @@ impl XrayApp {
             }
         }
 
-        egui::SidePanel::left("files").exact_width(240.0).show(ctx, |ui| {
+        egui::SidePanel::left("browser").exact_width(280.0).show(ctx, |ui| {
             ui.heading("Files");
+            ui.horizontal(|ui| {
+                if ui.button("↑ up").clicked() {
+                    self.fb.go_up();
+                }
+                if ui.button("home").clicked() {
+                    let home = std::env::var("HOME")
+                        .or_else(|_| std::env::var("USERPROFILE"))
+                        .unwrap_or_else(|_| ".".into());
+                    self.fb.enter(&home);
+                }
+            });
+            // Current dir (small text).
+            ui.strong(&self.fb.current_dir);
+            ui.small("(file browser — navigate to a folder, click a .dcm)");
+            if !self.fb.error.is_empty() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 100, 100),
+                    format!("can't read: {}", self.fb.error),
+                );
+            }
             ui.separator();
-            if self.dcm.entries.is_empty() {
-                ui.small("Scan a folder of .dcm files to begin.");
-            } else {
-                // Snapshot so we can call load() (mutable) while iterating.
-                let entries: Vec<_> = self
-                    .dcm
-                    .entries
-                    .iter()
-                    .map(|e| (e.name.clone(), e.path.clone(), e.rows, e.cols))
-                    .collect();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (name, path, rows, cols) in entries {
-                        let label = format!("{name}  ({}×{})", cols, rows);
-                        let is_sel = self.dcm.current_name == name;
+            // Snapshot entries so we can call fb/dcm (mutable) while iterating.
+            let entries = self.fb.entries.clone();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                if entries.is_empty() {
+                    ui.small("(empty folder)");
+                }
+                for e in entries {
+                    if e.is_dir {
+                        if ui
+                            .selectable_label(false, format!("📁 {}", e.name))
+                            .clicked()
+                        {
+                            self.fb.enter(&e.path);
+                        }
+                    } else {
+                        let is_dcm = e.name.to_lowercase().ends_with(".dcm");
+                        let is_sel = self.dcm.current_name == e.name;
+                        let label = if is_dcm {
+                            format!("📄 {}", e.name)
+                        } else {
+                            format!("· {}", e.name)
+                        };
                         if ui.selectable_label(is_sel, label).clicked() {
-                            self.dcm.load(&path);
+                            self.dcm.load(&e.path);
                         }
                     }
-                });
-            }
+                }
+            });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -473,8 +710,10 @@ impl XrayApp {
                 None => {
                     ui.vertical_centered(|ui| {
                         ui.add_space(32.0);
-                        ui.label("No file selected.");
-                        ui.small("Type a folder path above, hit scan, then pick a file.");
+                        ui.strong("No file selected.");
+                        ui.small("Use the file browser on the left to find a .dcm,");
+                        ui.small("or type a file/folder path above and hit load / scan.");
+                        ui.small("On Windows you can also drag a .dcm onto this window.");
                     });
                 }
             }
@@ -485,7 +724,7 @@ impl XrayApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([940.0, 560.0])
+            .with_inner_size([1040.0, 620.0])
             .with_title("Imaging viewer — DICOM / synthetic"),
         ..Default::default()
     };
@@ -494,4 +733,112 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(XrayApp::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_existing_file_is_file() {
+        let tmp = std::env::temp_dir().join("xray_route_test_file");
+        std::fs::write(&tmp, b"hi").unwrap();
+        let r = route_path(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(r, Route::File);
+    }
+
+    #[test]
+    fn route_existing_dir_is_folder() {
+        let tmp = std::env::temp_dir().join("xray_route_test_dir");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let r = route_path(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(r, Route::Folder);
+    }
+
+    #[test]
+    fn route_missing_is_ignore() {
+        let r = route_path(Path::new("/definitely/not/a/real/path/xray_test"));
+        assert_eq!(r, Route::Ignore);
+    }
+
+    /// FileBrowser lists real files/dirs, dirs-first, skips hidden.
+    #[test]
+    fn file_browser_lists_and_sorts() {
+        let base = std::env::temp_dir().join("xray_fb_test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("zeta")).unwrap();
+        std::fs::create_dir_all(base.join("alpha")).unwrap();
+        std::fs::write(base.join("b.dcm"), b"x").unwrap();
+        std::fs::write(base.join("a.dcm"), b"x").unwrap();
+        std::fs::write(base.join(".hidden"), b"x").unwrap();
+
+        let mut fb = FileBrowser {
+            current_dir: base.to_string_lossy().to_string(),
+            entries: Vec::new(),
+            error: String::new(),
+        };
+        fb.refresh();
+
+        // Hidden file excluded.
+        assert!(!fb.entries.iter().any(|e| e.name == ".hidden"));
+        // Two dirs + two files.
+        assert_eq!(fb.entries.iter().filter(|e| e.is_dir).count(), 2);
+        assert_eq!(fb.entries.iter().filter(|e| !e.is_dir).count(), 2);
+        // Dirs come first.
+        assert!(fb.entries[0].is_dir && fb.entries[1].is_dir);
+        // Dirs sorted case-insensitively: alpha before zeta.
+        assert_eq!(fb.entries[0].name, "alpha");
+        assert_eq!(fb.entries[1].name, "zeta");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// FileBrowser.go_up moves to the parent.
+    #[test]
+    fn file_browser_go_up() {
+        let base = std::env::temp_dir().join("xray_fb_up_parent");
+        let child = base.join("child");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&child).unwrap();
+        let mut fb = FileBrowser {
+            current_dir: child.to_string_lossy().to_string(),
+            entries: Vec::new(),
+            error: String::new(),
+        };
+        let base_str = base.to_string_lossy().to_string();
+        fb.go_up();
+        assert_eq!(fb.current_dir, base_str, "go_up should move to the parent");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// DicomState::handle_dropped_path on a real .dcm file loads it
+    /// (exercises the same path a file-browser click / drop takes).
+    #[test]
+    fn handle_dropped_real_dcm_file_loads() {
+        let dir = std::path::Path::new("/home/russ/dcm_test");
+        if !dir.is_dir() {
+            eprintln!("(skipped: no /home/russ/dcm_test)");
+            return;
+        }
+        let file = dir
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .find(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("dcm"))
+                    .unwrap_or(false)
+            })
+            .map(|e| e.path())
+            .expect("no .dcm in dcm_test");
+        let mut st = DicomState::new();
+        let msg = st.handle_dropped_path(&file.to_string_lossy());
+        assert!(
+            st.current.is_some(),
+            "expected current=Some, got None. msg: {msg}"
+        );
+    }
 }
