@@ -1,7 +1,8 @@
-# Imaging viewer — v3
+# Imaging viewer — v4
 
-X-ray / DICOM (`.dcm`) viewer with window/level + invert, plus a synthetic
-conveyor-belt demo. Rust + egui, single self-contained binary.
+X-ray / DICOM (`.dcm`) viewer with window/level + invert + **filters**
+(gamma / contrast / sharpen), plus a synthetic conveyor-belt demo. Rust + egui,
+single self-contained binary.
 
 ## Opening a file
 
@@ -22,12 +23,23 @@ guaranteed to work on GNOME Wayland** (Linux) *and* Windows.
 - **invert** — MONOCHROME1 / reversed display.
 - **auto window** — re-fit to the file's min/max.
 
+## Filters
+
+Post-processing applied after window/level (pure, unit-tested in
+`src/filters.rs`; neutral defaults = identity, so the image is untouched until
+you move a control):
+
+- **gamma** — brightness curve; < 1 brightens midtones, > 1 darkens.
+- **contrast** — spreads values about mid-gray; > 1 increases contrast.
+- **sharpen** — edge enhancement (unsharp mask); 0 = off, higher = crisper.
+- **reset filters** — returns all three to identity.
+
 ## Building
 
 ```bash
 cargo build --release                       # Linux
 cargo build --release --target x86_64-pc-windows-gnu   # Windows (mingw cross)
-cargo test --release                        # 16 tests
+cargo test --release                        # 28 tests (22 lib + 6 bin)
 ```
 
 ## AppImage

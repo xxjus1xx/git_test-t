@@ -289,27 +289,49 @@ impl DicomState {
         g.clamp(0.0, 255.0) as u8
     }
 
-    fn to_image(&self, f: &DcmFrame) -> egui::ColorImage {
+    fn to_image(
+        &self,
+        f: &DcmFrame,
+        gamma: f64,
+        contrast_k: f64,
+        sharpen: f64,
+    ) -> egui::ColorImage {
         let n = (f.rows as usize) * (f.cols as usize);
         let spp = (f.spp as usize).max(1);
-        let mut out = Vec::with_capacity(n);
 
+        // 1) Build the display grayscale buffer (window/level + invert applied).
+        let mut gray = vec![0u8; n];
         if spp == 3 {
             for i in 0..n {
                 let r = f.samples.get(i * 3).copied().unwrap_or(0.0) as f64;
                 let g = f.samples.get(i * 3 + 1).copied().unwrap_or(0.0) as f64;
                 let b = f.samples.get(i * 3 + 2).copied().unwrap_or(0.0) as f64;
-                let gray = 0.299 * r + 0.587 * g + 0.114 * b; // BT.601 luma
-                let g_val = self.map_sample(gray);
-                out.push(Color32::from_rgb(g_val, g_val, g_val));
+                let lum = 0.299 * r + 0.587 * g + 0.114 * b; // BT.601 luma
+                gray[i] = self.map_sample(lum);
             }
         } else {
             for i in 0..n {
                 let v = f.samples.get(i).copied().unwrap_or(0.0);
-                let g = self.map_sample(v as f64);
-                out.push(Color32::from_rgb(g, g, g));
+                gray[i] = self.map_sample(v as f64);
             }
         }
+
+        // 2) Apply the post-processing filter chain (gamma → contrast → sharpen).
+        //    Identity when all parameters are at their neutral defaults.
+        let filtered = xray_viewer::filters::apply_chain(
+            &gray,
+            f.rows,
+            f.cols,
+            gamma,
+            contrast_k,
+            sharpen,
+        );
+
+        // 3) Grayscale buffer → RGB pixels.
+        let out: Vec<Color32> = filtered
+            .iter()
+            .map(|&v| Color32::from_rgb(v, v, v))
+            .collect();
 
         egui::ColorImage {
             size: [f.cols as usize, f.rows as usize],
@@ -329,9 +351,12 @@ struct XrayApp {
     fill: f32,
     seed: u64,
     // Shared
-    fps_ema: f32,
     last_step: Instant,
     acc: f32,
+    // Post-processing filters (DICOM view). Neutral defaults = identity.
+    gamma: f64,
+    contrast_k: f64,
+    sharpen: f64,
     // DICOM
     dcm: DicomState,
     dcm_tex: egui::TextureHandle,
@@ -367,9 +392,11 @@ impl XrayApp {
             defect_rate: 0.25,
             fill: 0.75,
             seed: 0xC0FFEE,
-            fps_ema: 0.0,
             last_step: Instant::now(),
             acc: 0.0,
+            gamma: 1.0,
+            contrast_k: 1.0,
+            sharpen: 0.0,
             dcm: DicomState::new(),
             dcm_tex,
             file_path: String::new(),
@@ -435,15 +462,6 @@ impl eframe::App for XrayApp {
         let dt = now.duration_since(self.last_step).as_secs_f32();
         self.last_step = now;
 
-        if dt > 0.0 {
-            let inst = 1.0 / dt;
-            self.fps_ema = if self.fps_ema == 0.0 {
-                inst
-            } else {
-                0.9 * self.fps_ema + 0.1 * inst
-            };
-        }
-
         if self.mode == Mode::Synthetic {
             self.acc += dt;
             let tick = 1.0 / 60.0;
@@ -491,8 +509,6 @@ impl XrayApp {
                 if ui.selectable_label(self.mode == Mode::Dicom, "DICOM").clicked() {
                     self.mode = Mode::Dicom;
                 }
-                ui.separator();
-                ui.label(format!("FPS {:.0}", self.fps_ema));
                 if self.mode == Mode::Synthetic {
                     ui.separator();
                     ui.label(format!("count {}", self.source.count));
@@ -596,6 +612,41 @@ impl XrayApp {
                     }
                 });
 
+                // Row 3: post-processing filters (gamma / contrast / sharpen).
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("Filters");
+                    ui.separator();
+                    ui.label("gamma");
+                    let mut g = self.gamma;
+                    ui.add(egui::DragValue::new(&mut g).speed(0.05).range(0.1..=4.0));
+                    if g != self.gamma {
+                        self.gamma = g;
+                        self.dcm.mark_dirty();
+                    }
+                    ui.separator();
+                    ui.label("contrast");
+                    let mut k = self.contrast_k;
+                    ui.add(egui::DragValue::new(&mut k).speed(0.05).range(0.2..=4.0));
+                    if k != self.contrast_k {
+                        self.contrast_k = k;
+                        self.dcm.mark_dirty();
+                    }
+                    ui.separator();
+                    ui.label("sharpen");
+                    let mut s = self.sharpen;
+                    ui.add(egui::DragValue::new(&mut s).speed(0.02).range(0.0..=2.0));
+                    if s != self.sharpen {
+                        self.sharpen = s;
+                        self.dcm.mark_dirty();
+                    }
+                    if ui.button("reset filters").clicked() {
+                        self.gamma = 1.0;
+                        self.contrast_k = 1.0;
+                        self.sharpen = 0.0;
+                        self.dcm.mark_dirty();
+                    }
+                });
+
                 // Status + errors.
                 ui.horizontal_wrapped(|ui| {
                     if !self.status.is_empty() {
@@ -626,7 +677,7 @@ impl XrayApp {
         // actually changed (dirty flag), not every frame.
         if self.dcm.dirty {
             if let Some(f) = &self.dcm.current {
-                let img = self.dcm.to_image(f);
+                let img = self.dcm.to_image(f, self.gamma, self.contrast_k, self.sharpen);
                 self.dcm_tex.set(img, egui::TextureOptions::LINEAR);
                 self.dcm.dirty = false;
             }
