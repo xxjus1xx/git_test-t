@@ -84,6 +84,31 @@ pub fn apply_chain(
     crate::filters::sharpen(&c, rows, cols, sharpen)
 }
 
+/// Compute a 256-bin histogram of an 8-bit grayscale buffer: `out[i]` is the
+/// number of pixels whose value is exactly `i`.
+///
+/// Pure and allocation-light (one `u32` per bin). The sum of all bins equals
+/// `src.len()`. An empty buffer yields an all-zero 256-bin vector.
+pub fn histogram(src: &[u8]) -> Vec<u32> {
+    let mut h = vec![0u32; 256];
+    for &b in src {
+        h[b as usize] += 1;
+    }
+    h
+}
+
+/// Normalized histogram: bin counts scaled to [0.0, 1.0] where 1.0 is the
+/// tallest bin. Returns an all-zero 256-vector for an empty buffer. Used to
+/// draw the histogram so its height maps to the panel regardless of image size.
+pub fn histogram_normalized(src: &[u8]) -> Vec<f32> {
+    let h = histogram(src);
+    let peak = h.iter().max().copied().unwrap_or(0);
+    if peak == 0 {
+        return vec![0.0f32; 256];
+    }
+    h.iter().map(|&c| c as f32 / peak as f32).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +236,42 @@ mod tests {
         let b: Vec<u8> = (0..=255).collect();
         let o = apply_chain(&b, 1, 256, 1.0, 1.0, 0.0);
         assert_eq!(o, b);
+    }
+
+    #[test]
+    fn histogram_counts_per_bin() {
+        // Two of each: value 5 appears twice, value 200 appears twice.
+        let b = vec![5u8, 5, 200, 200, 120];
+        let h = histogram(&b);
+        assert_eq!(h.len(), 256);
+        assert_eq!(h[5], 2);
+        assert_eq!(h[200], 2);
+        assert_eq!(h[120], 1);
+        assert_eq!(h.iter().sum::<u32>(), 5, "sum of bins == pixel count");
+    }
+
+    #[test]
+    fn histogram_empty_is_all_zero_256() {
+        let h = histogram(&[]);
+        assert_eq!(h.len(), 256);
+        assert!(h.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn histogram_normalized_peaks_at_one() {
+        // Mixed values: the most common value should map to 1.0.
+        let b = vec![10u8, 10, 10, 250, 250];
+        let h = histogram_normalized(&b);
+        assert_eq!(h.len(), 256);
+        assert_eq!(h[10], 1.0, "peak bin should be 1.0");
+        assert!((h[250] - (2.0 / 3.0)).abs() < 1e-4, "250 bin should be 2/3");
+        assert!(h.iter().all(|&v| (0.0..=1.0).contains(&v)));
+    }
+
+    #[test]
+    fn histogram_normalized_empty_is_zero() {
+        let h = histogram_normalized(&[]);
+        assert_eq!(h.len(), 256);
+        assert!(h.iter().all(|&v| v == 0.0));
     }
 }

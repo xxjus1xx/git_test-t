@@ -161,6 +161,9 @@ struct DicomState {
     win_width: f64,
     invert: bool,
     dirty: bool,
+    /// Normalized 256-bin histogram of the *displayed* buffer (peaks at 1.0).
+    /// Updated whenever the image is re-rendered.
+    hist: Vec<f32>,
 }
 
 impl DicomState {
@@ -176,6 +179,7 @@ impl DicomState {
             win_width: 2000.0,
             invert: false,
             dirty: false,
+            hist: vec![0.0f32; 256],
         }
     }
 
@@ -289,17 +293,15 @@ impl DicomState {
         g.clamp(0.0, 255.0) as u8
     }
 
-    fn to_image(
-        &self,
-        f: &DcmFrame,
-        gamma: f64,
-        contrast_k: f64,
-        sharpen: f64,
-    ) -> egui::ColorImage {
+    /// Build the *displayed* grayscale buffer: window/level + invert applied,
+    /// then the post-processing filter chain (gamma → contrast → sharpen).
+    /// Shared by the image render and the histogram so both describe the same
+    /// pixels. Identity when all parameters are at their neutral defaults.
+    fn filtered_buffer(&self, f: &DcmFrame, gamma: f64, contrast_k: f64, sharpen: f64) -> Vec<u8> {
         let n = (f.rows as usize) * (f.cols as usize);
         let spp = (f.spp as usize).max(1);
 
-        // 1) Build the display grayscale buffer (window/level + invert applied).
+        // 1) Window/level + invert → grayscale buffer.
         let mut gray = vec![0u8; n];
         if spp == 3 {
             for i in 0..n {
@@ -316,27 +318,8 @@ impl DicomState {
             }
         }
 
-        // 2) Apply the post-processing filter chain (gamma → contrast → sharpen).
-        //    Identity when all parameters are at their neutral defaults.
-        let filtered = xray_viewer::filters::apply_chain(
-            &gray,
-            f.rows,
-            f.cols,
-            gamma,
-            contrast_k,
-            sharpen,
-        );
-
-        // 3) Grayscale buffer → RGB pixels.
-        let out: Vec<Color32> = filtered
-            .iter()
-            .map(|&v| Color32::from_rgb(v, v, v))
-            .collect();
-
-        egui::ColorImage {
-            size: [f.cols as usize, f.rows as usize],
-            pixels: out,
-        }
+        // 2) Filter chain (identity at neutral defaults).
+        xray_viewer::filters::apply_chain(&gray, f.rows, f.cols, gamma, contrast_k, sharpen)
     }
 }
 
@@ -671,13 +654,88 @@ impl XrayApp {
         });
     }
 
+    /// Render the 256-bin histogram of the currently displayed image as a
+    /// bar chart, plus a min/peak/max readout. Reads the live `dcm.hist`.
+    fn histogram_panel(&self, ui: &mut egui::Ui) {
+        let h = &self.dcm.hist;
+        let w = ui.available_width().max(40.0);
+        let ht = 120.0f32;
+        let bins = 256usize;
+        let bar = w / bins as f32;
+
+        // Stats: first/last non-empty bin + peak bin index.
+        let first = h.iter().position(|&v| v > 0.0).unwrap_or(0);
+        let last = h.iter().rposition(|&v| v > 0.0).unwrap_or(0);
+        let by_val = |a: &(usize, f32), b: &(usize, f32)| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+        };
+        let peak_bin = h.iter().cloned().enumerate().max_by(by_val).map(|(i, _)| i).unwrap_or(0);
+
+        ui.horizontal(|ui| {
+            ui.strong("Histogram");
+            ui.small(format!("min {first} · peak {peak_bin} · max {last}"));
+        });
+
+        let (rect, _resp) = ui.allocate_exact_size(egui::vec2(w, ht), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        // Background.
+        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 20, 24));
+        // Bars: one per bin, height ∝ normalized count.
+        for i in 0..bins {
+            let v = h[i];
+            if v <= 0.0 {
+                continue;
+            }
+            let hgt = (v * (ht - 2.0)).max(0.0);
+            let x0 = i as f32 * bar;
+            let x1 = (i + 1) as f32 * bar;
+            let y1 = ht;
+            let y0 = ht - hgt;
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
+                0.0,
+                egui::Color32::from_rgb(120, 190, 255),
+            );
+        }
+        // Baseline (thin filled rect — avoids the line_segment stroke API).
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(0.0, ht - 1.0), egui::pos2(w, ht)),
+            0.0,
+            egui::Color32::from_rgb(70, 75, 82),
+        );
+        // Axis end labels.
+        painter.text(
+            egui::pos2(2.0, ht - 2.0),
+            egui::Align2::LEFT_BOTTOM,
+            "0",
+            egui::FontId::monospace(10.0),
+            egui::Color32::GRAY,
+        );
+        painter.text(
+            egui::pos2(w - 2.0, ht - 2.0),
+            egui::Align2::RIGHT_BOTTOM,
+            "255",
+            egui::FontId::monospace(10.0),
+            egui::Color32::GRAY,
+        );
+        ui.add_space(4.0);
+    }
+
     /// DICOM: file browser (left) + image (center).
     fn dicom_body(&mut self, ctx: &egui::Context) {
         // Re-upload the image texture only when the file / window / invert
         // actually changed (dirty flag), not every frame.
         if self.dcm.dirty {
             if let Some(f) = &self.dcm.current {
-                let img = self.dcm.to_image(f, self.gamma, self.contrast_k, self.sharpen);
+                // One buffer pass feeds both the image and the histogram, so
+                // they always describe the same displayed pixels.
+                let buf = self.dcm.filtered_buffer(f, self.gamma, self.contrast_k, self.sharpen);
+                let out: Vec<Color32> = buf.iter().map(|&v| Color32::from_rgb(v, v, v)).collect();
+                let img = egui::ColorImage {
+                    size: [f.cols as usize, f.rows as usize],
+                    pixels: out,
+                };
+                self.dcm.hist = xray_viewer::filters::histogram_normalized(&buf);
                 self.dcm_tex.set(img, egui::TextureOptions::LINEAR);
                 self.dcm.dirty = false;
             }
@@ -756,6 +814,11 @@ impl XrayApp {
                     ui.separator();
                     ui.vertical_centered(|ui| {
                         ui.add(egui::Image::new((self.dcm_tex.id(), self.dcm_tex.size_vec2())));
+                        // Live histogram of the displayed image (tracks window/level + filters).
+                        if self.dcm.hist.iter().any(|&v| v > 0.0) {
+                            ui.add_space(8.0);
+                            self.histogram_panel(ui);
+                        }
                     });
                 }
                 None => {
