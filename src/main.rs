@@ -956,46 +956,28 @@ mod tests {
         );
     }
 
-    /// End-to-end on REAL data: load a .dcm, run the exact GUI pipeline
-    /// (window/level + filters → histogram) and assert the histogram is
-    /// well-formed: 256 bins, non-empty, peak normalized to 1.0, and the raw
-    /// bin counts sum to the pixel count. Catches any real-file assumption
-    /// (spp, bit depth, MONOCHROME1) the synthetic tests can't.
-    #[test]
-    fn histogram_end_to_end_on_real_dcm() {
-        let dir = std::path::Path::new("/home/russ/dcm_test");
-        if !dir.is_dir() {
-            eprintln!("(skipped: no /home/russ/dcm_test)");
-            return;
-        }
-        let file = dir
-            .read_dir()
-            .unwrap()
-            .flatten()
-            .find(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .map(|x| x.eq_ignore_ascii_case("dcm"))
-                    .unwrap_or(false)
-            })
-            .map(|e| e.path())
-            .expect("no .dcm in dcm_test");
-
+    /// Shared pipeline assertion: load `path`, run the exact GUI pipeline
+    /// (window/level + filters → histogram) on the displayed 8-bit buffer,
+    /// assert well-formedness. Catches real-file assumptions (spp, bit depth,
+    /// MONOCHROME1, rescaled f32 samples) the synthetic tests can't.
+    fn assert_pipeline_for(path: &std::path::Path) {
         let mut st = DicomState::new();
-        st.load(&file.to_string_lossy());
-        let f = st.current.as_ref().expect("load failed on real .dcm");
+        st.load(&path.to_string_lossy());
+        let f = st
+            .current
+            .as_ref()
+            .unwrap_or_else(|| panic!("load failed for {}", path.display()));
         let n = (f.rows as usize) * (f.cols as usize);
-        assert!(n > 0, "real file should have pixels");
+        assert!(n > 0, "real file should have pixels: {}", path.display());
 
-        // Neutral defaults (identity) — the histogram must reflect raw pixels.
+        // Neutral defaults (identity) — the histogram must reflect the image.
         let buf = st.filtered_buffer(f, 1.0, 1.0, 0.0);
         assert_eq!(buf.len(), n, "buffer length must equal pixel count");
 
         let raw = xray_viewer::filters::histogram(&buf);
         assert_eq!(raw.len(), 256);
         assert_eq!(raw.iter().sum::<u32>(), n as u32, "bin counts must sum to pixel count");
-        assert!(raw.iter().any(|&c| c > 0), "a real image must have non-empty bins");
+        assert!(raw.iter().any(|&c| c > 0), "image must have non-empty bins");
 
         let norm = xray_viewer::filters::histogram_normalized(&buf);
         assert_eq!(norm.len(), 256);
@@ -1009,5 +991,40 @@ mod tests {
         assert!(norm2.iter().all(|v| v.is_finite()), "no NaN/Inf after filters");
         assert!(norm2.iter().all(|&v| (0.0..=1.0).contains(&v)), "bounds hold after filters");
         assert!(norm2.iter().any(|&v| v > 0.0), "filtered image still has pixels");
+    }
+
+    /// End-to-end on REAL data: synthetic dcm_test set (if present) plus the
+    /// real clinical .dcm in ~/Downloads.
+    #[test]
+    fn histogram_end_to_end_on_real_dcm() {
+        let mut checked = 0usize;
+
+        let dir = std::path::Path::new("/home/russ/dcm_test");
+        if dir.is_dir() {
+            if let Some(file) = dir
+                .read_dir()
+                .unwrap()
+                .flatten()
+                .find(|e| {
+                    e.path()
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .map(|x| x.eq_ignore_ascii_case("dcm"))
+                        .unwrap_or(false)
+                })
+                .map(|e| e.path())
+            {
+                assert_pipeline_for(&file);
+                checked += 1;
+            }
+        }
+
+        let real = std::path::Path::new("/home/russ/Downloads/ct-lung-screening-nlst-instance.dcm");
+        if real.is_file() {
+            assert_pipeline_for(real);
+            checked += 1;
+        }
+
+        assert!(checked > 0, "no .dcm files found to test (dcm_test or Downloads)");
     }
 }
