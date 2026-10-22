@@ -955,4 +955,59 @@ mod tests {
             "expected current=Some, got None. msg: {msg}"
         );
     }
+
+    /// End-to-end on REAL data: load a .dcm, run the exact GUI pipeline
+    /// (window/level + filters → histogram) and assert the histogram is
+    /// well-formed: 256 bins, non-empty, peak normalized to 1.0, and the raw
+    /// bin counts sum to the pixel count. Catches any real-file assumption
+    /// (spp, bit depth, MONOCHROME1) the synthetic tests can't.
+    #[test]
+    fn histogram_end_to_end_on_real_dcm() {
+        let dir = std::path::Path::new("/home/russ/dcm_test");
+        if !dir.is_dir() {
+            eprintln!("(skipped: no /home/russ/dcm_test)");
+            return;
+        }
+        let file = dir
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .find(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("dcm"))
+                    .unwrap_or(false)
+            })
+            .map(|e| e.path())
+            .expect("no .dcm in dcm_test");
+
+        let mut st = DicomState::new();
+        st.load(&file.to_string_lossy());
+        let f = st.current.as_ref().expect("load failed on real .dcm");
+        let n = (f.rows as usize) * (f.cols as usize);
+        assert!(n > 0, "real file should have pixels");
+
+        // Neutral defaults (identity) — the histogram must reflect raw pixels.
+        let buf = st.filtered_buffer(f, 1.0, 1.0, 0.0);
+        assert_eq!(buf.len(), n, "buffer length must equal pixel count");
+
+        let raw = xray_viewer::filters::histogram(&buf);
+        assert_eq!(raw.len(), 256);
+        assert_eq!(raw.iter().sum::<u32>(), n as u32, "bin counts must sum to pixel count");
+        assert!(raw.iter().any(|&c| c > 0), "a real image must have non-empty bins");
+
+        let norm = xray_viewer::filters::histogram_normalized(&buf);
+        assert_eq!(norm.len(), 256);
+        let peak = norm.iter().cloned().fold(0.0f32, f32::max);
+        assert!((peak - 1.0).abs() < 1e-6, "peak bin must normalize to 1.0, got {peak}");
+        assert!(norm.iter().all(|&v| (0.0..=1.0).contains(&v)), "bins must stay in [0,1]");
+
+        // Non-identity filters must still yield a valid histogram (no NaN, bounds hold).
+        let buf2 = st.filtered_buffer(f, 0.8, 1.5, 1.0);
+        let norm2 = xray_viewer::filters::histogram_normalized(&buf2);
+        assert!(norm2.iter().all(|v| v.is_finite()), "no NaN/Inf after filters");
+        assert!(norm2.iter().all(|&v| (0.0..=1.0).contains(&v)), "bounds hold after filters");
+        assert!(norm2.iter().any(|&v| v > 0.0), "filtered image still has pixels");
+    }
 }
