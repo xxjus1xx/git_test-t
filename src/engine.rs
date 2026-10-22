@@ -103,7 +103,6 @@ impl Default for Materials {
 // ---------------------------------------------------------------------------
 #[derive(Debug, Clone)]
 struct Product {
-    id: u64,
     x: f32,
     fill: f32,
     foreign: Option<(f32, f32, f32)>,
@@ -119,7 +118,6 @@ pub struct Source {
     rng: Rng,
     seq: u64,
     products: Vec<Product>,
-    next_id: u64,
     pub gate_x: f32,
     pub count: u64,
     pub defect_count: u64,
@@ -139,7 +137,6 @@ impl Source {
             rng: Rng::new(seed),
             seq: 0,
             products: Vec::new(),
-            next_id: 0,
             gate_x,
             count: 0,
             defect_count: 0,
@@ -157,7 +154,6 @@ impl Source {
     }
     pub fn reset(&mut self) {
         self.products.clear();
-        self.next_id = 0;
         self.seq = 0;
         self.count = 0;
         self.defect_count = 0;
@@ -191,10 +187,8 @@ impl Source {
         //    per frame, and only when the belt has carried the last one forward.
         let newest_x = self.products.iter().map(|p| p.x).fold(f32::MAX, f32::min);
         if self.products.is_empty() || newest_x >= Self::spacing(&self.cfg) {
-            let id = self.next_id;
-            let p = self.spawn_product(id);
+            let p = self.spawn_product();
             self.products.push(p);
-            self.next_id += 1;
         }
 
         // 4) Count products crossing the gate (left edge passes gate_x).
@@ -222,7 +216,7 @@ impl Source {
         frame
     }
 
-    fn spawn_product(&mut self, id: u64) -> Product {
+    fn spawn_product(&mut self) -> Product {
         let has_defect = self.rng.chance(self.cfg.defect_rate);
         let (fill, foreign) = if has_defect {
             if self.rng.chance(0.5) {
@@ -240,7 +234,7 @@ impl Source {
         if has_defect {
             self.defect_count += 1;
         }
-        Product { id, x: 0.0, fill, foreign, counted: false }
+        Product { x: 0.0, fill, foreign, counted: false }
     }
 
     fn draw_product(&self, frame: &mut Frame, p: &Product) {
